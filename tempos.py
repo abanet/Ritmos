@@ -10,6 +10,10 @@ Uso:
   python3 tempos.py Ritmo_Render_90.aiff --desde 60 --hasta 120 --paso 5
   python3 tempos.py Ritmo_60.aiff Ritmo_90.aiff Ritmo_120.aiff --desde 60 --hasta 120 --paso 5
   python3 tempos.py ritmo.aiff --bpm-origen 90 --tempos 70,85,100 --nombre JazzFunk
+  python3 tempos.py Ritmo_60.aiff Ritmo_90.aiff --progresivo --desde 60 --hasta 100 --paso 2
+
+Con --progresivo sale un único audio que recorre todos los tempos, más el XML con el mapa de
+tempo que pide render-rhythm-video.js --xml.
 
 Los nombres de salida (<Nombre>-<bpm>.m4a) son los que espera render-rhythm-video.js --dir de
 guitar-visualizer (BPM = número final del nombre). Ver README.md para el resto de opciones.
@@ -18,6 +22,7 @@ Solo necesita ffmpeg compilado con librubberband (el de evermeet.cx lo trae). Si
 de Python: funciona con el python3 del sistema (3.7).
 """
 import argparse
+import array
 import json
 import math
 import os
@@ -46,6 +51,23 @@ MODOS = {
 # Estirado a partir del cual se avisa. Medido con una batería de BiaB en modo "bateria": hasta
 # +15% los golpes pierden ≤1 dB de pico; a +33% la claqueta ya cae 2-4 dB y a +50%, 3-7 dB.
 AVISO_ESTIRADO = 0.15
+
+# El filtro rubberband entrega cada golpe desplazado LATENCIA·(1 − 1/ratio) muestras: tarde al
+# acelerar, pronto al ralentizar (medido con un tren de golpes sintéticos: +4 ms a +15%, +10 ms
+# a +50%, −12 ms a −27%; son las mismas muestras a 44,1 y a 48 kHz). Constante a lo largo del
+# audio, así que se compensa al recortar el relleno. En modo "mezcla" el desvío depende de cada
+# golpe (unos ms, no sigue esta ley) y no se corrige.
+LATENCIA = {'bateria': 1389, 'mezcla': 0}
+
+# Modo progresivo: los tramos de cada tempo se unen con un fundido cruzado muy corto que acaba un
+# poco ANTES de la barra de compás, para que el golpe del primer tiempo pertenezca entero al
+# tramo nuevo (un corte justo en la barra parte los golpes que el batería adelanta unos ms).
+# Cada tramo trae como "entrada" el audio real que precede a ese compás en su ancla, así que lo
+# que se funde son dos versiones de la misma cola de platos, no un corte a silencio.
+ADELANTO_CORTE = 0.020
+FUNDIDO_CORTE = 0.010
+# Compases finales del ancla que no se usan como material (final de BiaB y cola del render).
+COLA_ANCLA = 4
 
 
 def error(msg):
@@ -130,6 +152,13 @@ def medir_sonoridad(ruta):
     return float(datos['input_i']), float(datos['input_tp'])
 
 
+def muestras_relleno(ratio, sr, modo):
+    """Muestras que ocupa el relleno de RELLENO_SEG una vez estirado, con la latencia del filtro."""
+    if abs(ratio - 1.0) < 1e-9:
+        return int(round(RELLENO_SEG * sr))
+    return int(round(RELLENO_SEG * sr / ratio + LATENCIA[modo] * (1 - 1 / ratio)))
+
+
 def estirar(ancla, bpm, args, tmp):
     """Estira el ancla hasta `bpm` y recorta/funde, dejando un WAV temporal. Devuelve sus datos
     (ruta, duración y, si se normaliza, sonoridad y pico medidos) para codificar() después."""
@@ -137,7 +166,7 @@ def estirar(ancla, bpm, args, tmp):
     sr = ancla['sr']
     filtros = []
     if abs(ratio - 1.0) > 1e-9:
-        relleno = int(round(RELLENO_SEG * sr / ratio))
+        relleno = muestras_relleno(ratio, sr, args.modo)
         filtros += [
             'adelay=%d:all=1' % int(RELLENO_SEG * 1000),
             'rubberband=tempo=%r:%s' % (ratio, MODOS[args.modo]),
@@ -177,6 +206,189 @@ def codificar(pista, destino, objetivo, args, codec):
     return ganancia
 
 
+def compas_de_origen(ancla, compas, n, intro, compases_tramo, tiempos):
+    """Compás del ancla (contando la claqueta) del que sale un tramo que empieza en el compás
+    `compas` del resultado: el mismo, para que el patrón y los redobles sigan donde los puso BiaB.
+    Si el ancla no da para tanto, se vuelve a su primer compás de ritmo. Devuelve (compás, volvió)."""
+    enteros = int(ancla['dur'] * ancla['bpm'] / 60.0 / tiempos + 1e-6)
+    bucle = enteros - COLA_ANCLA - intro
+    if bucle < compases_tramo:
+        error('el ancla de %g bpm es demasiado corta para tramos de %d compases.' % (ancla['bpm'], compases_tramo))
+    if compas + n <= intro + bucle:
+        return compas, False
+    pos = (compas - intro) % bucle
+    if pos + n > bucle:
+        pos = 0
+    return intro + pos, True
+
+
+def estirar_tramo(tr, ini, n_muestras, sr, args, ruta):
+    """Deja en `ruta` (PCM float estéreo sin cabecera) las muestras [ini, ini+n_muestras) del
+    resultado, sacadas del ancla del tramo de forma que su barra de compás caiga en tr['pulso']."""
+    a = tr['ancla']
+    ratio = tr['bpm'] / float(a['bpm'])
+    s0 = tr['origen'] * args.tiempos * 60.0 / a['bpm'] + (ini - tr['pulso']) / float(sr) * ratio
+    # Mismo relleno de RELLENO_SEG que en estirar(), pero con audio real del ancla hasta donde lo
+    # haya (y silencio el resto): el filtro arranca "en caliente" y no se come el primer ataque.
+    real = min(RELLENO_SEG, max(0.0, s0))
+    i0 = int(round((s0 - real) * a['sr']))
+    i1 = int(math.ceil((s0 + n_muestras / float(sr) * ratio + 0.5) * a['sr']))
+    silencio = int(round((RELLENO_SEG - real) * a['sr']))
+    filtros = ['atrim=start_sample=%d:end_sample=%d' % (i0, i1), 'asetpts=PTS-STARTPTS']
+    if silencio > 0:
+        filtros.append('adelay=%dS:all=1' % silencio)
+    if abs(ratio - 1.0) > 1e-9:
+        filtros.append('rubberband=tempo=%r:%s' % (ratio, MODOS[args.modo]))
+    k = muestras_relleno(ratio, sr, args.modo)
+    filtros += ['aformat=sample_fmts=flt:sample_rates=%d:channel_layouts=stereo' % sr, 'apad',
+                'atrim=start_sample=%d:end_sample=%d' % (k, k + n_muestras), 'asetpts=PTS-STARTPTS']
+    ffmpeg(['-y', '-i', a['ruta'], '-map', '0:a:0', '-af', ','.join(filtros), '-f', 'f32le', ruta])
+    if os.path.getsize(ruta) != n_muestras * 8:
+        error('el tramo de %d bpm no tiene la duración esperada.' % tr['bpm'])
+
+
+def escribir_xml(ruta, titulo, tramos, intro, tiempos):
+    """MusicXML mínimo con lo que lee guitar-visualizer (loadXML y tempo-progression.js): un
+    <sound tempo> en el compás donde cambia el tempo y un acorde de referencia en el primer compás
+    tras la claqueta, que es lo que marca cuántos compases de intro hay. Sin notas de batería."""
+    div = 120
+    l = ['<?xml version="1.0" encoding="UTF-8"?>',
+         '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.0 Partwise//EN"',
+         '"http://www.musicxml.org/dtds/partwise.dtd">',
+         '<score-partwise version="3.0">',
+         '<work>', '  <work-title>%s</work-title>' % titulo, '</work>',
+         '<identification>', ' <encoding>', '  <software>ritmos-tempo (tempos.py --progresivo)</software>',
+         ' </encoding>', '</identification>',
+         '  <part-list>', '   <score-part id="P1">', '      <part-name>Drums</part-name>', '   </score-part>',
+         '  </part-list>', '  <part id="P1">']
+    num = 0
+    for tr in tramos:
+        for j in range(tr['n']):
+            num += 1
+            l.append('    <measure number="%d">' % num)
+            if num == 1:
+                l += ['      <attributes>', '        <divisions>%d</divisions>' % div,
+                      '        <key>', '          <fifths>0</fifths>', '        </key>',
+                      '        <time>', '           <beats>%d</beats>' % tiempos,
+                      '           <beat-type>4</beat-type>', '        </time>',
+                      '        <clef>', '          <sign>percussion</sign>', '        </clef>',
+                      '      </attributes>']
+            if j == 0:
+                l.append('      <sound tempo="%d"/>' % tr['bpm'])
+            if num == intro + 1:
+                l += ['      <harmony>', '        <root>', '          <root-step>C</root-step>', '        </root>',
+                      '        <kind>major</kind>', '      </harmony>']
+            l += ['      <note>', '        <rest measure="yes"/>', '        <duration>%d</duration>' % (div * tiempos),
+                  '      </note>', '    </measure>']
+    l += ['  </part>', '</score-partwise>', '']
+    with open(ruta, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(l))
+
+
+def progresivo(anclas, tempos, base, salida, args, codec):
+    """Un único audio que recorre `tempos` (N compases en cada uno, tras la claqueta al primer
+    tempo) más el XML con el mapa de tempo: el par que pide render-rhythm-video.js --xml."""
+    sr = anclas[0]['sr']
+    intro = args.intro_compases
+    fade = args.fade if args.fade is not None else 2.0
+    adelanto = int(round(ADELANTO_CORTE * sr))
+    xf = int(round(FUNDIDO_CORTE * sr))
+
+    tramos = []
+    t = 0.0
+    compas = 0
+    for i, bpm in enumerate(tempos):
+        n = args.compases_por_tempo + (intro if i == 0 else 0)
+        ancla = min(anclas, key=lambda a: abs(math.log(bpm / float(a['bpm']))))
+        origen, vuelta = compas_de_origen(ancla, compas, n, intro, args.compases_por_tempo, args.tiempos)
+        tramos.append({'bpm': bpm, 'ancla': ancla, 'n': n, 'compas': compas, 't': t,
+                       'pulso': int(round(t * sr)), 'origen': origen, 'vuelta': vuelta})
+        t += n * args.tiempos * 60.0 / bpm
+        compas += n
+    fin = int(round(t * sr))
+    total = fin + int(round(fade * sr))
+
+    destino = os.path.abspath(os.path.join(salida, base + '.m4a'))
+    if destino in set(a['ruta'] for a in anclas):
+        error('la salida %s pisaría un ancla; usa otra --salida o --nombre.' % destino)
+
+    tmp = tempfile.mkdtemp(prefix='ritmos-tempo-')
+    try:
+        print('Estirando…')
+        crudo = os.path.join(tmp, 'total.f32')
+        cola = None
+        with open(crudo, 'wb') as out:
+            for i, tr in enumerate(tramos):
+                ini = 0 if i == 0 else tr['pulso'] - adelanto - xf
+                hasta = tramos[i + 1]['pulso'] - adelanto if i + 1 < len(tramos) else total
+                ruta = os.path.join(tmp, '%d.f32' % i)
+                estirar_tramo(tr, ini, hasta - ini, sr, args, ruta)
+                with open(ruta, 'rb') as f:
+                    datos = f.read()
+                os.remove(ruta)
+                if cola is not None:
+                    # Fundido cruzado lineal entre la cola del tramo anterior y la entrada de este.
+                    a = array.array('f')
+                    a.frombytes(cola)
+                    b = array.array('f')
+                    b.frombytes(datos[:xf * 8])
+                    for j in range(xf):
+                        g = (j + 0.5) / xf
+                        a[2 * j] = a[2 * j] * (1 - g) + b[2 * j] * g
+                        a[2 * j + 1] = a[2 * j + 1] * (1 - g) + b[2 * j + 1] * g
+                    out.write(a.tobytes())
+                    datos = datos[xf * 8:]
+                if i + 1 < len(tramos):
+                    out.write(datos[:-xf * 8])
+                    cola = datos[-xf * 8:]
+                else:
+                    out.write(datos)
+                ratio = tr['bpm'] / float(tr['ancla']['bpm'])
+                aviso = '  ⚠ estirado grande: añade un ancla más cercana' if abs(ratio - 1) > AVISO_ESTIRADO + 1e-9 else ''
+                if tr['vuelta']:
+                    aviso += '  ⚠ el ancla no da para tanto: vuelve a su compás %d' % (tr['origen'] + 1)
+                print('  · %d bpm  compases %d–%d (desde %d:%04.1f)  ancla %g (%+.0f%%)%s' % (
+                    tr['bpm'], tr['compas'] + 1, tr['compas'] + tr['n'], int(tr['t'] // 60), tr['t'] % 60,
+                    tr['ancla']['bpm'], (ratio - 1) * 100, aviso))
+
+        wav = os.path.join(tmp, 'total.wav')
+        ffmpeg(['-y', '-f', 'f32le', '-ar', str(sr), '-ac', '2', '-i', crudo]
+               + (['-af', 'afade=t=out:st=%.6f:d=%.6f' % (fin / float(sr), fade)] if fade > 0 else [])
+               + ['-c:a', 'pcm_f32le', wav])
+        os.remove(crudo)
+        pista = {'wav': wav}
+        objetivo = None
+        if args.lufs is not None:
+            pista['lufs'], pista['pico'] = medir_sonoridad(wav)
+            objetivo = min(args.lufs, pista['lufs'] + args.pico - pista['pico'])
+            if objetivo < args.lufs - 0.05:
+                print('Sonoridad: %.1f LUFS no se alcanza sin saturar picos; va a %.1f LUFS.' % (args.lufs, objetivo))
+        print('Codificando…')
+        ganancia = codificar(pista, destino, objetivo, args, codec)
+        print('  ✓ %s  %+.1f dB · %d compases · %d:%04.1f' % (
+            os.path.basename(destino), ganancia, compas, int(total / sr // 60), total / float(sr) % 60))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    xml = os.path.join(salida, base + '.xml')
+    escribir_xml(xml, base, tramos, intro, args.tiempos)
+    print('  ✓ %s  (mapa de tempo: %s)' % (os.path.basename(xml), ' → '.join(str(tr['bpm']) for tr in tramos)))
+
+
+def escribir_config(salida, args):
+    if not args.estilo:
+        return
+    cfg_path = os.path.join(salida, 'config.json')
+    cfg = {'style': args.estilo, 'substyle': args.subestilo, 'beats': args.tiempos,
+           'introBars': args.intro_compases, 'offsetMs': 0, 'extraSec': 2}
+    if args.color:
+        cfg['colorPreset'] = args.color
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+    print('config.json escrito: %s' % cfg_path)
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Genera .m4a del mismo ritmo a distintos tempos a partir de uno o varios audios ancla.',
@@ -193,6 +405,10 @@ def main():
     p.add_argument('--salida', help='carpeta de salida (por defecto: <Nombre>_<desde>_<hasta>_<paso> junto al ancla)')
     p.add_argument('--modo', choices=sorted(MODOS), default='bateria',
                    help='tipo de material: "bateria" para percusión, "mezcla" si el bajo/armonía suena raro')
+    p.add_argument('--progresivo', action='store_true',
+                   help='un único audio que recorre todos los tempos, más el XML con el mapa de tempo '
+                   '(para render-rhythm-video.js --xml)')
+    p.add_argument('--compases-por-tempo', type=int, default=8, help='--progresivo: compases en cada tempo')
     p.add_argument('--compases', type=int, help='recorta cada audio a este nº de compases (contando la claqueta)')
     p.add_argument('--tiempos', type=int, default=4, help='tiempos por compás (para --compases y config.json)')
     p.add_argument('--fade', type=float, help='fundido final en segundos (por defecto: 2 si se usa --compases, 0 si no)')
@@ -203,13 +419,19 @@ def main():
     p.add_argument('--estilo', help='si se indica, escribe también un config.json para render-rhythm-video.js --dir')
     p.add_argument('--subestilo', default='', help='config.json: subestilo')
     p.add_argument('--color', help='config.json: colorPreset (rock, funk, jazz, blues, metal, pop, reggae, afrocubano…)')
-    p.add_argument('--intro-compases', type=int, default=2, help='config.json: compases de claqueta (introBars)')
+    p.add_argument('--intro-compases', type=int, default=2,
+                   help='compases de claqueta del ancla (introBars del config.json y, con --progresivo, del XML)')
     args = p.parse_args()
     if args.sin_normalizar:
         args.lufs = None
 
     codec = comprobar_ffmpeg()
     tempos = lista_tempos(args)
+    if args.progresivo:
+        if args.compases:
+            error('--compases no se usa con --progresivo; el largo lo da --compases-por-tempo.')
+        if len(tempos) < 2 or args.compases_por_tempo <= 0 or args.intro_compases < 0:
+            error('--progresivo necesita al menos dos tempos y --compases-por-tempo mayor que 0.')
 
     if args.bpm_origen and len(args.bpm_origen) != len(args.anclas):
         error('--bpm-origen necesita un valor por cada ancla (%d).' % len(args.anclas))
@@ -226,9 +448,11 @@ def main():
         error('hay dos anclas con el mismo BPM.')
 
     nombre = args.nombre or nombre_base(anclas[0]['ruta'])
-    salida = args.salida or os.path.join(
-        os.path.dirname(anclas[0]['ruta']),
-        '%s_%d_%d_%d' % (nombre, tempos[0], tempos[-1], args.paso) if not args.tempos else '%s_tempos' % nombre)
+    if args.progresivo:
+        carpeta = '%s_progresivo' % nombre
+    else:
+        carpeta = '%s_%d_%d_%d' % (nombre, tempos[0], tempos[-1], args.paso) if not args.tempos else '%s_tempos' % nombre
+    salida = args.salida or os.path.join(os.path.dirname(anclas[0]['ruta']), carpeta)
     os.makedirs(salida, exist_ok=True)
 
     print('Ritmo: %s · %d tempos (%d–%d bpm) · modo %s · %s' % (nombre, len(tempos), tempos[0], tempos[-1], args.modo, codec))
@@ -236,6 +460,16 @@ def main():
         print('  ancla %g bpm: %s (%.1fs ≈ %.1f compases de %d)' % (
             a['bpm'], os.path.basename(a['ruta']), a['dur'], a['dur'] * a['bpm'] / 60.0 / args.tiempos, args.tiempos))
     print('Salida: %s' % salida)
+
+    if args.progresivo:
+        # El nombre NO puede acabar en número: en el módulo Ritmo, guitar-visualizer toma el número
+        # final del nombre del audio como BPM base y pisa el del XML (los de BiaB se libran porque
+        # acaban en _Render).
+        base = '%s-%d-%d' % (nombre, tempos[0], tempos[-1]) + ('' if args.tempos else '-incr%d' % args.paso) + '-progresivo'
+        progresivo(anclas, tempos, base, salida, args, codec)
+        escribir_config(salida, args)
+        print('Hecho: %s.m4a + %s.xml' % (base, base))
+        return
 
     rutas_ancla = set(a['ruta'] for a in anclas)
     destinos = {}
@@ -277,16 +511,7 @@ def main():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    if args.estilo:
-        cfg_path = os.path.join(salida, 'config.json')
-        cfg = {'style': args.estilo, 'substyle': args.subestilo, 'beats': args.tiempos,
-               'introBars': args.intro_compases, 'offsetMs': 0, 'extraSec': 2}
-        if args.color:
-            cfg['colorPreset'] = args.color
-        with open(cfg_path, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-            f.write('\n')
-        print('config.json escrito: %s' % cfg_path)
+    escribir_config(salida, args)
     print('Hecho: %d archivos.' % len(tempos))
 
 

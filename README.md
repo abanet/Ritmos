@@ -35,6 +35,35 @@ se escribe si se pasa `--estilo`:
 node scripts/render-rhythm-video.js --dir ~/Downloads/JazzFunk_60_120_5 --out ~/Downloads/JazzFunk_60_120_5
 ```
 
+## Tempo progresivo
+
+Con `--progresivo` sale un único audio que recorre todos los tempos (N compases en cada uno, tras
+la claqueta al primer tempo) y el XML con el mapa de tempo: el par que pide
+`render-rhythm-video.js --xml`, sin montar el Tempo Track en BiaB.
+
+```sh
+python3 tempos.py Ritmo_Render_65.aiff Ritmo_Render_85.aiff Ritmo_Render_110.aiff \
+  --progresivo --desde 60 --hasta 120 --paso 2 --compases-por-tempo 8 --nombre JazzFunk
+
+node scripts/render-rhythm-video.js --xml JazzFunk-60-120-incr2-progresivo.xml \
+  --audio JazzFunk-60-120-incr2-progresivo.m4a --style "JAZZ FUNK" --color-preset funk
+```
+
+Salida, por defecto en `<Nombre>_progresivo/` junto al ancla: `<Nombre>-<desde>-<hasta>-incr<paso>-progresivo.m4a`
+y `.xml` con el mismo nombre (lo que empareja `--xml-dir`). El nombre no acaba en número a
+propósito: guitar-visualizer toma el número final del nombre del audio como BPM base y pisaría
+el del XML.
+
+- Cada tramo sale del ancla más cercana y de los **mismos compases** que ocuparía en ella, así
+  el patrón y los redobles siguen donde los puso BiaB. Las anclas tienen que ser renders del
+  mismo tema, con `--intro-compases` de claqueta (2 por defecto), y durar tantos compases como
+  la progresión; si no, el tramo vuelve al principio del ancla y el script lo avisa.
+- Los tramos se unen con un fundido cruzado de 10 ms que acaba 20 ms antes de la barra de compás.
+- El XML es mínimo: un `<sound tempo>` donde cambia el tempo y un acorde de referencia (C) en el
+  primer compás tras la claqueta. No lleva las notas de batería.
+- Tras el último compás el ritmo sigue `--fade` segundos (2 por defecto) fundiéndose, para que
+  el vídeo no acabe en seco.
+
 ## Opciones
 
 | Opción | Qué hace |
@@ -44,6 +73,8 @@ node scripts/render-rhythm-video.js --dir ~/Downloads/JazzFunk_60_120_5 --out ~/
 | `--bpm-origen 60 90` | BPM de cada ancla, en orden, si el nombre no lo lleva |
 | `--nombre`, `--salida` | Nombre base de los archivos y carpeta de salida |
 | `--modo bateria\|mezcla` | `bateria` (por defecto) conserva mejor los golpes; `mezcla` si el bajo o la armonía suenan "fasosos" |
+| `--progresivo` | Un único audio con todos los tempos + XML con el mapa de tempo (ver arriba) |
+| `--compases-por-tempo 8` | Con `--progresivo`: compases en cada tempo |
 | `--compases N` | Recorta cada audio a N compases (contando la claqueta) |
 | `--tiempos 4` | Tiempos por compás |
 | `--fade S` | Fundido final (por defecto 2 s con `--compases`, 0 sin él) |
@@ -76,7 +107,10 @@ con números redondos, **65, 85 y 110** cubren 57–126. Estirar hacia abajo (ra
 mejor los golpes que acelerar, así que ante la duda el ancla mejor un poco por encima.
 
 El tempo no deriva: la duración sale exacta y la desviación respecto a la rejilla es la misma
-al principio y al final de un ancla de 8 minutos (unos pocos ms constantes).
+al principio y al final de un ancla de 8 minutos. El filtro desplaza todos los golpes una
+cantidad fija que depende del estirado (+4 ms a +15%, +10 ms a +50%, −12 ms a −27%); en modo
+`bateria` el script la compensa y los golpes quedan a ±2 ms de donde estaban en el ancla. En
+modo `mezcla` el desvío varía de un golpe a otro (unos ms) y no se corrige.
 
 ## Cómo funciona
 
