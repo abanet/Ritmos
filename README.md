@@ -54,6 +54,20 @@ y `.xml` con el mismo nombre (lo que empareja `--xml-dir`). El nombre no acaba e
 propósito: guitar-visualizer toma el número final del nombre del audio como BPM base y pisaría
 el del XML.
 
+El recorrido del rango lo decide `--forma`:
+
+| `--forma` | Recorrido (ejemplo con `--desde 60 --hasta 80 --paso 5`) |
+|---|---|
+| `sube` (por defecto) | 60 → 65 → 70 → 75 → 80 |
+| `baja` | 80 → 75 → 70 → 65 → 60 |
+| `piramide` | 60 → 65 → 70 → 75 → 80 → 75 → 70 → 65 → 60 |
+| `zigzag` | 60 → 70 → 65 → 75 → 70 → 80 (dos pasos adelante, uno atrás) |
+
+Para cualquier otro recorrido, `--tempos 60,120,60,120` se respeta en el orden dado. El nombre
+del archivo acaba en la forma (`…-incr5-piramide`). Con `piramide` y `zigzag`,
+`check-tempo-xml.js` de guitar-visualizer avisa de saltos "distintos del habitual": es un falso
+positivo (espera escaleras regulares) y solo impide generar el vídeo si se usa `--strict`.
+
 - Cada tramo sale del ancla más cercana y de los **mismos compases** que ocuparía en ella, así
   el patrón y los redobles siguen donde los puso BiaB. Las anclas tienen que ser renders del
   mismo tema, con `--intro-compases` de claqueta (2 por defecto), y durar tantos compases como
@@ -75,6 +89,8 @@ el del XML.
 | `--modo bateria\|mezcla` | `bateria` (por defecto) conserva mejor los golpes; `mezcla` si el bajo o la armonía suenan "fasosos" |
 | `--progresivo` | Un único audio con todos los tempos + XML con el mapa de tempo (ver arriba) |
 | `--compases-por-tempo 8` | Con `--progresivo`: compases en cada tempo |
+| `--forma sube\|baja\|piramide\|zigzag` | Con `--progresivo`: recorrido del rango |
+| `--minutos M` | Recorta cada audio a unos M minutos, en compases enteros (frases de 4 tras la claqueta), para que todos los tempos duren parecido |
 | `--compases N` | Recorta cada audio a N compases (contando la claqueta) |
 | `--tiempos 4` | Tiempos por compás |
 | `--fade S` | Fundido final (por defecto 2 s con `--compases`, 0 sin él) |

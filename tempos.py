@@ -139,7 +139,26 @@ def lista_tempos(args):
         tempos = list(range(args.desde, args.hasta + 1, args.paso))
     if not tempos or min(tempos) <= 0:
         error('lista de tempos vacía o no válida.')
-    return sorted(set(tempos))
+    if not args.progresivo:
+        return sorted(set(tempos))
+    # En progresivo el orden ES el recorrido: una lista de --tempos se respeta tal cual, y un
+    # rango se recorre según --forma.
+    if args.tempos or args.forma == 'sube':
+        return tempos
+    if args.forma == 'baja':
+        return tempos[::-1]
+    if args.forma == 'piramide':
+        return tempos + tempos[-2::-1]
+    # zigzag: dos pasos adelante y uno atrás (60, 70, 65, 75, 70, 80…) hasta llegar arriba.
+    zigzag = [tempos[0]]
+    i = 0
+    while i < len(tempos) - 1:
+        i = min(i + 2, len(tempos) - 1)
+        zigzag.append(tempos[i])
+        if i < len(tempos) - 1:
+            i -= 1
+            zigzag.append(tempos[i])
+    return zigzag
 
 
 def medir_sonoridad(ruta):
@@ -159,12 +178,36 @@ def muestras_relleno(ratio, sr, modo):
     return int(round(RELLENO_SEG * sr / ratio + LATENCIA[modo] * (1 - 1 / ratio)))
 
 
+def compases_a_generar(bpm, args):
+    """Compases (contando la claqueta) a los que se recorta el audio de `bpm`, o None si va entero.
+    Con --minutos son los que caben en ese tiempo, redondeados a frases de 4 compases tras la
+    claqueta para que todos los tempos acaben en final de frase."""
+    if args.minutos:
+        frases = int(round((args.minutos * bpm / float(args.tiempos) - args.intro_compases) / 4.0))
+        return args.intro_compases + 4 * max(1, frases)
+    return args.compases
+
+
 def estirar(ancla, bpm, args, tmp):
     """Estira el ancla hasta `bpm` y recorta/funde, dejando un WAV temporal. Devuelve sus datos
     (ruta, duración y, si se normaliza, sonoridad y pico medidos) para codificar() después."""
     ratio = bpm / float(ancla['bpm'])
     sr = ancla['sr']
+    dur = ancla['dur'] / ratio
+    compases = compases_a_generar(bpm, args)
+    recorte = False
+    if compases:
+        dur_compases = compases * args.tiempos * 60.0 / bpm
+        if dur_compases > dur + 0.05:
+            print('  ⚠ %d bpm: el ancla solo da para %.1f compases de los %d pedidos; no se recorta.'
+                  % (bpm, dur * bpm / 60.0 / args.tiempos, compases))
+        else:
+            dur = dur_compases
+            recorte = True
     filtros = []
+    if recorte:
+        # Se recorta ya el ancla (con 1 s de margen) para no estirar minutos que luego se tiran.
+        filtros.append('atrim=end=%.6f' % (dur * ratio + 1.0))
     if abs(ratio - 1.0) > 1e-9:
         relleno = muestras_relleno(ratio, sr, args.modo)
         filtros += [
@@ -173,16 +216,9 @@ def estirar(ancla, bpm, args, tmp):
             'atrim=start_sample=%d' % relleno,
             'asetpts=PTS-STARTPTS',
         ]
-    dur = ancla['dur'] / ratio
-    if args.compases:
-        dur_compases = args.compases * args.tiempos * 60.0 / bpm
-        if dur_compases > dur + 0.05:
-            print('  ⚠ %d bpm: el ancla solo da para %.1f compases; no se recorta.'
-                  % (bpm, dur * bpm / 60.0 / args.tiempos))
-        else:
-            dur = dur_compases
-            filtros.append('atrim=end=%.6f' % dur)
-    fade = args.fade if args.fade is not None else (2.0 if args.compases else 0.0)
+    if recorte:
+        filtros.append('atrim=end=%.6f' % dur)
+    fade = args.fade if args.fade is not None else (2.0 if compases else 0.0)
     if fade > 0:
         filtros.append('afade=t=out:st=%.6f:d=%.6f' % (max(0.0, dur - fade), fade))
 
@@ -409,6 +445,10 @@ def main():
                    help='un único audio que recorre todos los tempos, más el XML con el mapa de tempo '
                    '(para render-rhythm-video.js --xml)')
     p.add_argument('--compases-por-tempo', type=int, default=8, help='--progresivo: compases en cada tempo')
+    p.add_argument('--forma', choices=['sube', 'baja', 'piramide', 'zigzag'], default='sube',
+                   help='--progresivo: recorrido del rango. piramide sube y vuelve a bajar; zigzag avanza '
+                   'dos pasos y retrocede uno. Con --tempos se respeta el orden de la lista')
+    p.add_argument('--minutos', type=float, help='recorta cada audio a esta duración aproximada (compases enteros)')
     p.add_argument('--compases', type=int, help='recorta cada audio a este nº de compases (contando la claqueta)')
     p.add_argument('--tiempos', type=int, default=4, help='tiempos por compás (para --compases y config.json)')
     p.add_argument('--fade', type=float, help='fundido final en segundos (por defecto: 2 si se usa --compases, 0 si no)')
@@ -425,11 +465,13 @@ def main():
     if args.sin_normalizar:
         args.lufs = None
 
+    if args.compases and args.minutos:
+        error('usa --compases o --minutos, no los dos.')
     codec = comprobar_ffmpeg()
     tempos = lista_tempos(args)
     if args.progresivo:
-        if args.compases:
-            error('--compases no se usa con --progresivo; el largo lo da --compases-por-tempo.')
+        if args.compases or args.minutos:
+            error('--compases y --minutos no se usan con --progresivo; el largo lo da --compases-por-tempo.')
         if len(tempos) < 2 or args.compases_por_tempo <= 0 or args.intro_compases < 0:
             error('--progresivo necesita al menos dos tempos y --compases-por-tempo mayor que 0.')
 
@@ -455,7 +497,7 @@ def main():
     salida = args.salida or os.path.join(os.path.dirname(anclas[0]['ruta']), carpeta)
     os.makedirs(salida, exist_ok=True)
 
-    print('Ritmo: %s · %d tempos (%d–%d bpm) · modo %s · %s' % (nombre, len(tempos), tempos[0], tempos[-1], args.modo, codec))
+    print('Ritmo: %s · %d tempos (%d–%d bpm) · modo %s · %s' % (nombre, len(tempos), min(tempos), max(tempos), args.modo, codec))
     for a in anclas:
         print('  ancla %g bpm: %s (%.1fs ≈ %.1f compases de %d)' % (
             a['bpm'], os.path.basename(a['ruta']), a['dur'], a['dur'] * a['bpm'] / 60.0 / args.tiempos, args.tiempos))
@@ -465,7 +507,11 @@ def main():
         # El nombre NO puede acabar en número: en el módulo Ritmo, guitar-visualizer toma el número
         # final del nombre del audio como BPM base y pisa el del XML (los de BiaB se libran porque
         # acaban en _Render).
-        base = '%s-%d-%d' % (nombre, tempos[0], tempos[-1]) + ('' if args.tempos else '-incr%d' % args.paso) + '-progresivo'
+        if args.tempos:
+            base = '%s-%d-%d-progresivo' % (nombre, min(tempos), max(tempos))
+        else:
+            base = '%s-%d-%d-incr%d-%s' % (nombre, args.desde, args.hasta, args.paso,
+                                           'progresivo' if args.forma == 'sube' else args.forma)
         progresivo(anclas, tempos, base, salida, args, codec)
         escribir_config(salida, args)
         print('Hecho: %s.m4a + %s.xml' % (base, base))
