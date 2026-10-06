@@ -125,6 +125,18 @@ def info_audio(ruta):
     return int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3)), int(f.group(1))
 
 
+def fin_del_audio(ruta, dur):
+    """Segundo en el que acaba el sonido del archivo: si termina con un silencio largo, donde
+    empieza ese silencio; si no, su duración."""
+    err = ffmpeg(['-i', ruta, '-map', '0:a:0', '-af', 'silencedetect=noise=-60dB:d=5', '-f', 'null', '-'])
+    inicios = re.findall(r'silence_start:\s*(-?[\d.]+)', err)
+    finales = re.findall(r'silence_end:\s*(-?[\d.]+)', err)
+    # El último silencio llega hasta el final si no tiene silence_end o si acaba con el archivo.
+    if inicios and (len(finales) < len(inicios) or float(finales[-1]) > dur - 0.5):
+        return max(0.0, float(inicios[-1]))
+    return dur
+
+
 def lista_tempos(args):
     if args.tempos:
         try:
@@ -485,6 +497,15 @@ def main():
         if not bpm:
             error('no sé el BPM de %s: no acaba en número; indícalo con --bpm-origen.' % os.path.basename(ruta))
         dur, sr = info_audio(ruta)
+        # Un export de BiaB puede durar los compases pedidos y llevar batería solo en los primeros
+        # (caso real: 36 compases de 262). La sonoridad no lo delata, porque LUFS ignora el silencio.
+        # Unos pocos compases de cola en silencio son normales; más de 8 es un export incompleto.
+        fin = fin_del_audio(ruta, dur)
+        if (dur - fin) * bpm / 60.0 / args.tiempos > 8:
+            error('%s solo tiene sonido hasta %d:%02d de %d:%02d (%.0f compases de %.0f); el resto es '
+                  'silencio. Revisa el export de BiaB.' % (
+                      os.path.basename(ruta), fin // 60, fin % 60, dur // 60, dur % 60,
+                      fin * bpm / 60.0 / args.tiempos, dur * bpm / 60.0 / args.tiempos))
         anclas.append({'ruta': os.path.abspath(ruta), 'bpm': bpm, 'dur': dur, 'sr': sr})
     if len(set(a['bpm'] for a in anclas)) != len(anclas):
         error('hay dos anclas con el mismo BPM.')
